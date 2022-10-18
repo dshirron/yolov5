@@ -23,6 +23,7 @@ if platform.system() != 'Windows':
 
 from models.common import *
 from models.experimental import *
+from utils.activations import replace_activations
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
@@ -353,7 +354,13 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         if i == 0:
             ch = []
         ch.append(c2)
-    return nn.Sequential(*layers), sorted(save)
+    model = nn.Sequential(*layers)
+    # override all activations in model if provided in config
+    if 'act' in d:
+        LOGGER.info(f'overriding activations in model to {d["act"]}')
+        replace_activations(model, d["act"])
+
+    return model, sorted(save)
 
 
 if __name__ == '__main__':

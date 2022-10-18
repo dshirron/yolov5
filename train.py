@@ -32,6 +32,8 @@ import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+import torch.nn.utils.prune as prune
+import copy
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -64,6 +66,83 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+def remove_parameters(model):
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+        elif isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+
+    return model
+
+def measure_module_sparsity(module, weight=True, bias=False, use_mask=False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    if use_mask == True:
+        for buffer_name, buffer in module.named_buffers():
+            if "weight_mask" in buffer_name and weight == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+            if "bias_mask" in buffer_name and bias == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+    else:
+        for param_name, param in module.named_parameters():
+            if "weight" in param_name and weight == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+            if "bias" in param_name and bias == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
+
+def measure_global_sparsity(
+    model, weight = True,
+    bias = False, conv2d_use_mask = False,
+    linear_use_mask = False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    for module_name, module in model.named_modules():
+
+        if isinstance(module, torch.nn.Conv2d):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=conv2d_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+        elif isinstance(module, torch.nn.Linear):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=linear_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -161,8 +240,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
+    # Pruning
+    
+    parameters_to_prune = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            parameters_to_prune.append((module, "weight"))
+        elif isinstance(module, torch.nn.Linear):
+            parameters_to_prune.append((module, "weight"))
+    
     # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
+    #ema = ModelEMA(model) if RANK in {-1, 0} else None
+    ema = None #dans disable ema until i make it compatible with prune
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
@@ -256,7 +345,39 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    #prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    #prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    #sparsification_freq = 12
+    #target_sparsity = 0.7
+    prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    sparsification_freq = 12 # This is freq (in epochs) for sparsification events
+    target_sparsity = 0.7
+    sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
+    sparsification_amount_per_event = 1-np.power((1-target_sparsity),(1/sparsification_events))
+    
+    # We check model sparsity and make sure masks are updated accordingly. This is mainly for resume cases - Dans
+    pruned_model = copy.deepcopy(model)
+    pruned_model = remove_parameters(pruned_model)
+    # Compute global sparsity-
+    num_zeros, num_elements, sparsity = measure_global_sparsity(
+        pruned_model, weight = True,
+        bias = False, conv2d_use_mask = False,
+        linear_use_mask = False)
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method = prune.L1Unstructured,
+        amount = sparsity,
+    )
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        if epoch>=prunning_start_epoch and epoch<=prunning_end_epoch:
+            if ((epoch-prunning_start_epoch) % sparsification_freq) == 0:
+                prune.global_unstructured(
+                    parameters_to_prune,
+                    pruning_method = prune.L1Unstructured,
+                    amount = sparsification_amount_per_event,
+                )
         callbacks.run('on_train_epoch_start')
         model.train()
 
@@ -334,6 +455,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
+            #break # dans debug to do only 1 batch per epoch
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -343,14 +465,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            if ema: # dans update ema attr only if ema enabled
+                ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
                 results, maps, _ = validate.run(data_dict,
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
                                                 half=amp,
-                                                model=ema.ema,
+                                                model=ema.ema if ema else deepcopy(de_parallel(model)), #dans
                                                 single_cls=single_cls,
                                                 dataloader=val_loader,
                                                 save_dir=save_dir,
@@ -368,23 +491,48 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {
-                    'epoch': epoch,
-                    'best_fitness': best_fitness,
-                    'model': deepcopy(de_parallel(model)).half(),
-                    'ema': deepcopy(ema.ema).half(),
-                    'updates': ema.updates,
-                    'optimizer': optimizer.state_dict(),
-                    'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
-                    'opt': vars(opt),
-                    'date': datetime.now().isoformat()}
+                if ema:
+                    ckpt = {'epoch': epoch,
+                            'best_fitness': best_fitness,
+                            'model': deepcopy(de_parallel(model)).half(),
+                            'ema': deepcopy(ema.ema).half(),
+                            'updates': ema.updates,
+                            'optimizer': optimizer.state_dict(),
+                            'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
+                            'opt': vars(opt),
+                            'date': datetime.now().isoformat()}
+                else:
+                    #model.eval()
+                    #pruned_model = copy.deepcopy(model)
+                    
+                    pruned_model = remove_parameters(model)
+                    # Compute global sparsity-
+                    num_zeros, num_elements, sparsity = measure_global_sparsity(
+                        pruned_model, weight = True,
+                        bias = False, conv2d_use_mask = False,
+                        linear_use_mask = False)
+                    
+                    print(f"Global sparsity = {sparsity * 100:.3f}% & val_accuracy = {results[2] * 100:.3f}%")
+
+                    ckpt = {'epoch': epoch,
+                            'best_fitness': best_fitness,
+                            'model': deepcopy(de_parallel(pruned_model)).half(),
+                            'ema': None,
+                            'updates': None,
+                            'optimizer': optimizer.state_dict(),
+                            'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
+		                    'opt': vars(opt),
+                            'date': datetime.now().isoformat()}
+
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
+
                 if best_fitness == fi:
                     torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
+                del pruned_model
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
