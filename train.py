@@ -248,10 +248,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             parameters_to_prune.append((module, "weight"))
         elif isinstance(module, torch.nn.Linear):
             parameters_to_prune.append((module, "weight"))
+
     
     # EMA
-    #ema = ModelEMA(model) if RANK in {-1, 0} else None
-    ema = None #dans disable ema until i make it compatible with prune
+    ema = ModelEMA(model) if RANK in {-1, 0} else None
+    #ema = None #dans disable ema until i make it compatible with prune
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
@@ -349,12 +350,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     #prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     #sparsification_freq = 12
     #target_sparsity = 0.7
+    
     prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     sparsification_freq = 12 # This is freq (in epochs) for sparsification events
     target_sparsity = 0.7
     sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
-    sparsification_amount_per_event = 1-np.power((1-target_sparsity),(1/sparsification_events))
+    sparsification_amount_per_event = target_sparsity / sparsification_events
     
     # We check model sparsity and make sure masks are updated accordingly. This is mainly for resume cases - Dans
     pruned_model = copy.deepcopy(model)
@@ -369,14 +371,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         pruning_method = prune.L1Unstructured,
         amount = sparsity,
     )
+    model = remove_parameters(model)
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         if epoch>=prunning_start_epoch and epoch<=prunning_end_epoch:
             if ((epoch-prunning_start_epoch) % sparsification_freq) == 0:
+                model = remove_parameters(model) # dans - remove pruning masks from model and update weights of pruned elements to zero. This is so that when we prune the model below the "amount" parameter will be absolute and not in addition to models current sparsity
+                current_sparsification_event = (epoch-prunning_start_epoch) // sparsification_freq+1
+                current_sparsity = sparsification_amount_per_event * current_sparsification_event
                 prune.global_unstructured(
                     parameters_to_prune,
                     pruning_method = prune.L1Unstructured,
-                    amount = sparsification_amount_per_event,
+                    amount = current_sparsity,
                 )
         callbacks.run('on_train_epoch_start')
         model.train()
@@ -399,6 +405,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
+        batch_count = 0
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -443,7 +450,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
+                    model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+                    num_zeros, num_elements, sparsity = measure_global_sparsity(
+                        model, weight = True,
+                        bias = False, conv2d_use_mask = False,
+                        linear_use_mask = False)
+                    
                     ema.update(model)
+                    prune.global_unstructured( # Dans, add back pruning masks to model
+                        parameters_to_prune,
+                        pruning_method = prune.L1Unstructured,
+                        amount = sparsity,
+                    )
+
                 last_opt_step = ni
 
             # Log
@@ -455,7 +474,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
-            #break # dans debug to do only 1 batch per epoch
+            batch_count+=1
+            #if batch_count==2:
+            #    break # dans debug to do only 1 batch per epoch
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -463,6 +484,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         scheduler.step()
 
         if RANK in {-1, 0}:
+            model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+            num_zeros, num_elements, sparsity = measure_global_sparsity(
+                model, weight = True,
+                bias = False, conv2d_use_mask = False,
+                linear_use_mask = False)
+            
+            
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             if ema: # dans update ema attr only if ema enabled
@@ -480,7 +508,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 plots=False,
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss)
-
+                print(f"Global sparsity = {sparsity * 100:.3f}% & val_accuracy = {results[2] * 100:.3f}%")
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
@@ -502,21 +530,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                             'opt': vars(opt),
                             'date': datetime.now().isoformat()}
                 else:
-                    #model.eval()
-                    #pruned_model = copy.deepcopy(model)
-                    
-                    pruned_model = remove_parameters(model)
-                    # Compute global sparsity-
-                    num_zeros, num_elements, sparsity = measure_global_sparsity(
-                        pruned_model, weight = True,
-                        bias = False, conv2d_use_mask = False,
-                        linear_use_mask = False)
-                    
-                    print(f"Global sparsity = {sparsity * 100:.3f}% & val_accuracy = {results[2] * 100:.3f}%")
-
                     ckpt = {'epoch': epoch,
                             'best_fitness': best_fitness,
-                            'model': deepcopy(de_parallel(pruned_model)).half(),
+                            'model': deepcopy(de_parallel(model)).half(),
                             'ema': None,
                             'updates': None,
                             'optimizer': optimizer.state_dict(),
@@ -532,9 +548,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
-                del pruned_model
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+            prune.global_unstructured( # Dans, add back pruning masks to model
+                parameters_to_prune,
+                pruning_method = prune.L1Unstructured,
+                amount = sparsity,
+            )
 
         # EarlyStopping
         if RANK != -1:  # if DDP training
