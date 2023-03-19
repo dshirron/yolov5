@@ -354,7 +354,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     sparsification_freq = 12 # This is freq (in epochs) for sparsification events
-    target_sparsity = 0.7
+    target_sparsity = 0.75
     sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
     sparsification_amount_per_event = target_sparsity / sparsification_events
     
@@ -371,7 +371,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         pruning_method = prune.L1Unstructured,
         amount = sparsity,
     )
-    model = remove_parameters(model)
+    print(f"Initial Global sparsity = {sparsity * 100:.3f}%0")
+    #model = remove_parameters(model)
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         if epoch>=prunning_start_epoch and epoch<=prunning_end_epoch:
