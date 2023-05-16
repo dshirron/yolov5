@@ -354,7 +354,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     sparsification_freq = 12 # This is freq (in epochs) for sparsification events
-    target_sparsity = 0.75
+    target_sparsity = 0.94
     sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
     sparsification_amount_per_event = target_sparsity / sparsification_events
     
@@ -513,7 +513,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-            if fi > best_fitness:
+            if fi > best_fitness and epoch>=prunning_end_epoch:
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)

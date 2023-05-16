@@ -44,7 +44,85 @@ from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
+import torch.nn.utils.prune as prune
 
+def remove_parameters(model):
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+        elif isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+
+    return model
+
+def measure_module_sparsity(module, weight=True, bias=False, use_mask=False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    if use_mask == True:
+        for buffer_name, buffer in module.named_buffers():
+            if "weight_mask" in buffer_name and weight == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+            if "bias_mask" in buffer_name and bias == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+    else:
+        for param_name, param in module.named_parameters():
+            if "weight" in param_name and weight == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+            if "bias" in param_name and bias == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
+
+def measure_global_sparsity(
+    model, weight = True,
+    bias = False, conv2d_use_mask = False,
+    linear_use_mask = False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    for module_name, module in model.named_modules():
+
+        if isinstance(module, torch.nn.Conv2d):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=conv2d_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+        elif isinstance(module, torch.nn.Linear):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=linear_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -155,6 +233,21 @@ def run(
         data = check_dataset(data)  # check
 
     # Configure
+
+    # Pruning
+    
+    parameters_to_prune = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            parameters_to_prune.append((module, "weight"))
+        elif isinstance(module, torch.nn.Linear):
+            parameters_to_prune.append((module, "weight"))
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method = prune.L1Unstructured,
+        amount = 0.94,
+    )
+
     model.eval()
     cuda = device.type != 'cpu'
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
@@ -193,6 +286,13 @@ def run(
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
+    model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+    num_zeros, num_elements, sparsity = measure_global_sparsity(
+            model, weight = True,
+            bias = False, conv2d_use_mask = False,
+            linear_use_mask = False)
+    print(f"Initial Global sparsity = {sparsity * 100:.3f}%0")    
+
     pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
