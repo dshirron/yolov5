@@ -234,9 +234,9 @@ def run(
 
     # Configure
 
-    # Pruning - Need to remove this for training
+    # Pruning
     
-    '''parameters_to_prune = []
+    parameters_to_prune = []
     for module_name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d):
             parameters_to_prune.append((module, "weight"))
@@ -245,8 +245,8 @@ def run(
     prune.global_unstructured(
         parameters_to_prune,
         pruning_method = prune.L1Unstructured,
-        amount = 0.7,
-    )'''
+        amount = 0.94,
+    )
 
     model.eval()
     cuda = device.type != 'cpu'

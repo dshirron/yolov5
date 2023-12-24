@@ -72,9 +72,88 @@ from utils.dataloaders import LoadImages
 from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check_requirements, check_version,
                            check_yaml, colorstr, file_size, get_default_args, print_args, url2file, yaml_save)
 from utils.torch_utils import select_device, smart_inference_mode
+import torch.nn.utils.prune as prune
 
 MACOS = platform.system() == 'Darwin'  # macOS environment
 
+
+def remove_parameters(model):
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+        elif isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+
+    return model
+
+def measure_module_sparsity(module, weight=True, bias=False, use_mask=False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    if use_mask == True:
+        for buffer_name, buffer in module.named_buffers():
+            if "weight_mask" in buffer_name and weight == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+            if "bias_mask" in buffer_name and bias == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+    else:
+        for param_name, param in module.named_parameters():
+            if "weight" in param_name and weight == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+            if "bias" in param_name and bias == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
+
+def measure_global_sparsity(
+    model, weight = True,
+    bias = False, conv2d_use_mask = False,
+    linear_use_mask = False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    for module_name, module in model.named_modules():
+
+        if isinstance(module, torch.nn.Conv2d):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=conv2d_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+        elif isinstance(module, torch.nn.Linear):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=linear_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
 
 def export_formats():
     # YOLOv5 export formats
@@ -138,6 +217,7 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
     f = file.with_suffix('.onnx')
 
     output_names = ['output0', 'output1'] if isinstance(model, SegmentationModel) else ['output0']
+    output_names = ['output0', 'output1'] if isinstance(model, SegmentationModel) else ['Conv_329']
     if dynamic:
         dynamic = {'images': {0: 'batch', 2: 'height', 3: 'width'}}  # shape(1,3,640,640)
         if isinstance(model, SegmentationModel):
@@ -467,7 +547,7 @@ def run(
         optimize=False,  # TorchScript: optimize for mobile
         int8=False,  # CoreML/TF INT8 quantization
         dynamic=False,  # ONNX/TF/TensorRT: dynamic axes
-        simplify=False,  # ONNX: simplify model
+        simplify=True,  # ONNX: simplify model
         opset=12,  # ONNX: opset version
         verbose=False,  # TensorRT: verbose log
         workspace=4,  # TensorRT: workspace size (GB)
@@ -504,7 +584,29 @@ def run(
     im = torch.zeros(batch_size, 3, *imgsz).to(device)  # image size(1,3,320,192) BCHW iDetection
 
     # Update model
+    # Pruning
+    
+    parameters_to_prune = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            parameters_to_prune.append((module, "weight"))
+        elif isinstance(module, torch.nn.Linear):
+            parameters_to_prune.append((module, "weight"))
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method = prune.L1Unstructured,
+        amount = 0.7,
+    )
+
     model.eval()
+
+    model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+    num_zeros, num_elements, sparsity = measure_global_sparsity(
+            model, weight = True,
+            bias = False, conv2d_use_mask = False,
+            linear_use_mask = False)
+    print(f"Initial Global sparsity = {sparsity * 100:.3f}%0")    
+
     for k, m in model.named_modules():
         if isinstance(m, Detect):
             m.inplace = inplace

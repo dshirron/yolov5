@@ -46,6 +46,8 @@ from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 import torch.nn.utils.prune as prune
 
+QUANTIZE_MODEL = True
+
 def remove_parameters(model):
 
     for module_name, module in model.named_modules():
@@ -171,6 +173,55 @@ def process_batch(detections, labels, iouv):
             correct[matches[:, 1].astype(int), i] = True
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
+def calibrate_model(model, loader, device=torch.device("cpu:0")):
+
+    model.to(device)
+    model.eval()
+    calibration_samples=1300
+    current_sample=0
+    s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
+    dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    loss = torch.zeros(3, device=device)
+    jdict, stats, ap, ap_class = [], [], [], []
+    pbar = tqdm(loader, desc="Calibrating for quantization")  # progress bar
+    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+        if (current_sample % 100) == 0:
+            im=im.float()
+            im /= 255
+            _ = model(im)
+        if current_sample>=calibration_samples:
+            break
+        current_sample+=1
+
+class QuantizedModelWrapper(torch.nn.Module):
+    def __init__(self, model_fp32):
+        super(QuantizedModelWrapper, self).__init__()
+        # QuantStub converts tensors from floating point to quantized.
+        # This will only be used for inputs.
+        self.quant = torch.quantization.QuantStub()
+        # DeQuantStub converts tensors from quantized to floating point.
+        # This will only be used for outputs.
+        self.dequant = torch.quantization.DeQuantStub()
+        # FP32 model
+        self.model = model_fp32
+
+    def forward(self, x):
+        # manually specify where tensors will be converted from floating
+        # point to quantized in the quantized model
+        x = self.quant(x)
+
+        x = self.model(x)
+        # manually specify where tensors will be converted from quantized
+        # to floating point in the quantized model
+        #x = self.dequant(x)
+        return x[0]
+
+def save_model(model, model_dir, model_filename):
+
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    model_filepath = os.path.join(model_dir, model_filename)
+    torch.save(model.state_dict(), model_filepath)
 
 @smart_inference_mode()
 def run(
@@ -210,6 +261,8 @@ def run(
         half &= device.type != 'cpu'  # half precision only supported on CUDA
         model.half() if half else model.float()
     else:  # called directly
+        if QUANTIZE_MODEL:
+            device='cpu'
         device = select_device(device, batch_size=batch_size)
 
         # Directories
@@ -273,6 +326,70 @@ def run(
                                        rect=rect,
                                        workers=workers,
                                        prefix=colorstr(f'{task}: '))[0]
+    #fuse
+    # Move the model to CPU since static quantization does not support CUDA currently.
+    # Make a copy of the model for layer fusion
+    if QUANTIZE_MODEL:
+        #model = remove_parameters(model)
+        import copy
+        fused_model = copy.deepcopy(model.model)
+
+        # The model has to be switched to evaluation mode before any layer fusion.
+        # Otherwise the quantization will not work correctly.
+        fused_model.eval()
+
+        # Fuse the model in place rather manually.
+        # Conv+Relu fusion
+        for module_name, module in fused_model.named_children():
+            for basic_block_name, basic_block in module.named_children():
+                if basic_block.type == 'models.common.Conv':
+                    torch.quantization.fuse_modules(basic_block, [["conv", "act"]], inplace=True)
+
+
+        quantized_model = QuantizedModelWrapper(model_fp32=fused_model)
+
+        quantization_config = torch.quantization.QConfig(activation=torch.quantization.HistogramObserver.with_args(dtype=torch.quint8), weight=torch.quantization.PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+        #quantization_config = torch.quantization.QConfig(activation=torch.quantization.MinMaxObserver.with_args(dtype=torch.quint8), weight=torch.quantization.PerChannelMinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+        # Custom quantization configurations
+        # quantization_config = torch.quantization.default_qconfig
+        # quantization_config = torch.quantization.QConfig(activation=torch.quantization.MinMaxObserver.with_args(dtype=torch.quint8), weight=torch.quantization.MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_channel_symmetric))
+
+        quantized_model.qconfig = quantization_config
+
+        # Print quantization configurations
+        #print(quantized_model.qconfig)
+        torch.quantization.prepare(quantized_model, inplace=True)
+
+        # Use training data for calibration.
+        cuda_device = torch.device("cuda:0")
+        cpu_device = torch.device("cpu:0")
+
+        calibrate_model(model=quantized_model, loader=dataloader, device=cpu_device)
+        l = [module for module in quantized_model.modules() if not isinstance(module, torch.nn.Sequential)]
+        #print('Model observer results:')
+        #print (l)
+        #for i,layer in enumerate(l):
+        #    if isinstance(layer,torch.ao.quantization.observer.HistogramObserver):
+        #        print('At layer:'+str(i))
+        #        print ('Min: '+str(layer.state_dict()['min_val'])+', Max: '+str(layer.state_dict()['max_val']))
+        print('Quantizing model......................')
+
+        quantized_model = torch.quantization.convert(quantized_model, inplace=True)
+
+        # Using high-level static quantization wrapper
+        # The above steps, including torch.quantization.prepare, calibrate_model, and torch.quantization.convert, are also equivalent to
+        # quantized_model = torch.quantization.quantize(model=quantized_model, run_fn=calibrate_model, run_args=[train_loader], mapping=None, inplace=False)
+
+        quantized_model.eval()
+
+        # Print quantized model.
+        print('Quantized model (after calibration):')
+        print(quantized_model)
+        device=cpu_device
+        source_model_dir = os.path.dirname(weights[0])
+        quantized_model_filename = 'quant.pt'
+
+        save_model(model=quantized_model, model_dir=source_model_dir, model_filename=quantized_model_filename)
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
@@ -306,7 +423,13 @@ def run(
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            if compute_loss:
+                preds, train_out = model(im)
+            else:
+                if QUANTIZE_MODEL:
+                    preds = quantized_model(im)
+                else:
+                    preds, train_out = (model(im, augment=augment), None)  # inference, loss outputs
 
         # Loss
         if compute_loss:

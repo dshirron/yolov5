@@ -354,7 +354,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
     sparsification_freq = 12 # This is freq (in epochs) for sparsification events
-    target_sparsity = 0.94
+    target_sparsity = 0.70
     sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
     sparsification_amount_per_event = target_sparsity / sparsification_events
     
